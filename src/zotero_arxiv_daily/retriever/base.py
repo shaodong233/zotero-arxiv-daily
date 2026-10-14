@@ -1,9 +1,11 @@
 from abc import ABC, abstractmethod
 from omegaconf import DictConfig
 from ..protocol import Paper, RawPaperItem
-from concurrent.futures import ProcessPoolExecutor
+from tqdm import tqdm
 from typing import Type
 from loguru import logger
+
+
 class BaseRetriever(ABC):
     name: str
     def __init__(self, config:DictConfig):
@@ -20,11 +22,20 @@ class BaseRetriever(ABC):
 
     def retrieve_papers(self) -> list[Paper]:
         raw_papers = self._retrieve_raw_papers()
-        papers = []
         logger.info("Processing papers...")
-        with ProcessPoolExecutor(max_workers=self.config.executor.max_workers) as exec_pool:
-            papers = list(exec_pool.map(self.convert_to_paper, raw_papers))
-        return [p for p in papers if p is not None]
+        papers = []
+        # Serial conversion avoids ProcessPoolExecutor deadlocks after heavy imports
+        # (torch/onnx/pymupdf) and keeps progress visible in Actions logs.
+        for raw_paper in tqdm(raw_papers, total=len(raw_papers), desc="Converting papers"):
+            try:
+                paper = self.convert_to_paper(raw_paper)
+            except Exception as exc:
+                title = getattr(raw_paper, "title", raw_paper)
+                logger.warning(f"Skipping paper {title}: {type(exc).__name__}: {exc}")
+                continue
+            if paper is not None:
+                papers.append(paper)
+        return papers
 
 registered_retrievers = {}
 

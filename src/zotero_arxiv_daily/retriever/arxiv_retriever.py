@@ -7,11 +7,18 @@ from tempfile import TemporaryDirectory
 from dataclasses import dataclass, field
 import feedparser
 from tqdm import tqdm
+import multiprocessing
 import os
 import re
+from queue import Empty
 from time import sleep
+from typing import Any, Callable, TypeVar
 from loguru import logger
 import requests
+
+T = TypeVar("T")
+DOWNLOAD_TIMEOUT = (10, 60)
+PDF_EXTRACT_TIMEOUT = 120
 
 # arXiv asks API clients to identify themselves. Since ~2026-09-23 the export API
 # answers HTTP 406 to requests from GitHub Actions that use a generic User-Agent.
@@ -191,32 +198,90 @@ class ArxivRetriever(BaseRetriever):
         return raw_papers
 
     def convert_to_paper(self, raw_paper: ArxivResult) -> Paper:
-        title = raw_paper.title
-        authors = [a.name for a in raw_paper.authors]
-        abstract = raw_paper.summary
-        pdf_url = raw_paper.pdf_url
-        full_text = None
-        try:
-            with TemporaryDirectory() as temp_dir:
-                path = os.path.join(temp_dir, "paper.pdf")
-                with requests.get(pdf_url, stream=True, timeout=(10, 60), headers={"User-Agent": USER_AGENT}) as response:
-                    response.raise_for_status()
-                    with open(path, "wb") as file:
-                        for chunk in response.iter_content(chunk_size=1024 * 1024):
-                            if chunk:
-                                file.write(chunk)
-                try:
-                    full_text = extract_markdown_from_pdf(path)
-                except Exception as e:
-                    logger.warning(f"Failed to extract full text of {title}: {e}")
-        except Exception as e:
-            logger.warning(f"Failed to download PDF of {title}: {e}")
+        # Metadata only here. PDF full-text is fetched later for the top-N
+        # reranked papers so daily Actions do not download hundreds of PDFs.
         return Paper(
             source=self.name,
-            title=title,
-            authors=authors,
-            abstract=abstract,
+            title=raw_paper.title,
+            authors=[a.name for a in raw_paper.authors],
+            abstract=raw_paper.summary,
             url=raw_paper.entry_id,
-            pdf_url=pdf_url,
-            full_text=full_text
+            pdf_url=raw_paper.pdf_url,
+            full_text=None,
         )
+
+
+def _download_pdf(pdf_url: str, path: str) -> None:
+    with requests.get(
+        pdf_url, stream=True, timeout=DOWNLOAD_TIMEOUT, headers={"User-Agent": USER_AGENT}
+    ) as response:
+        response.raise_for_status()
+        with open(path, "wb") as file:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    file.write(chunk)
+
+
+def _extract_text_from_pdf_worker(pdf_url: str) -> str:
+    with TemporaryDirectory() as temp_dir:
+        path = os.path.join(temp_dir, "paper.pdf")
+        _download_pdf(pdf_url, path)
+        return extract_markdown_from_pdf(path)
+
+
+def _run_in_subprocess(
+    result_queue: Any,
+    func: Callable[..., T | None],
+    args: tuple[Any, ...],
+) -> None:
+    try:
+        result_queue.put(("ok", func(*args)))
+    except Exception as exc:
+        result_queue.put(("error", f"{type(exc).__name__}: {exc}"))
+
+
+def _run_with_hard_timeout(
+    func: Callable[..., T | None],
+    args: tuple[Any, ...],
+    *,
+    timeout: float,
+    operation: str,
+    paper_title: str,
+) -> T | None:
+    """Kill hung pymupdf/network work after timeout (thread timeouts cannot)."""
+    start_methods = multiprocessing.get_all_start_methods()
+    context = multiprocessing.get_context("fork" if "fork" in start_methods else start_methods[0])
+    result_queue = context.Queue()
+    process = context.Process(target=_run_in_subprocess, args=(result_queue, func, args))
+    process.start()
+    try:
+        status, payload = result_queue.get(timeout=timeout)
+    except Empty:
+        if process.is_alive():
+            process.kill()
+        process.join(5)
+        result_queue.close()
+        result_queue.join_thread()
+        logger.warning(f"{operation} timed out for {paper_title} after {timeout} seconds")
+        return None
+
+    process.join(5)
+    result_queue.close()
+    result_queue.join_thread()
+    if status == "ok":
+        return payload
+    logger.warning(f"{operation} failed for {paper_title}: {payload}")
+    return None
+
+
+def enrich_paper_full_text(paper: Paper, timeout: float = PDF_EXTRACT_TIMEOUT) -> None:
+    """Download+extract PDF full text into paper.full_text (best-effort)."""
+    if paper.full_text or not paper.pdf_url:
+        return
+    paper.full_text = _run_with_hard_timeout(
+        _extract_text_from_pdf_worker,
+        (paper.pdf_url,),
+        timeout=timeout,
+        operation="PDF extraction",
+        paper_title=paper.title,
+    )

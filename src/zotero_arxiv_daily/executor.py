@@ -78,8 +78,13 @@ class Executor:
             logger.info("Reranking papers...")
             reranked_papers = self.reranker.rerank(all_papers, corpus)
             reranked_papers = reranked_papers[:self.config.executor.max_paper_num]
+            logger.info("Fetching full text for top papers...")
+            from .retriever.arxiv_retriever import enrich_paper_full_text
+            for p in tqdm(reranked_papers, desc="Full text"):
+                if p.source == "arxiv":
+                    enrich_paper_full_text(p)
             logger.info("Generating TLDR and affiliations...")
-            for p in tqdm(reranked_papers):
+            for p in tqdm(reranked_papers, desc="TLDR"):
                 p.generate_tldr(self.openai_client, self.config.llm)
                 p.generate_affiliations(self.openai_client, self.config.llm)
         elif not self.config.executor.send_empty:
