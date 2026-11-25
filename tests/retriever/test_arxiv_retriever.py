@@ -1,17 +1,37 @@
 from zotero_arxiv_daily.retriever.arxiv_retriever import ArxivRetriever
+from zotero_arxiv_daily.retriever import arxiv_retriever as arxiv_mod
 import feedparser
 import pickle
+from pathlib import Path
+
+
+def _xml_response(content: bytes, status_code: int = 200):
+    class Resp:
+        def __init__(self):
+            self.status_code = status_code
+            self.content = content
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise arxiv_mod.requests.HTTPError(f"HTTP {self.status_code}")
+
+    return Resp()
+
+
+def _mock_rss_get(monkeypatch, content: bytes, status_code: int = 200):
+    def fake_get(url, *args, **kwargs):
+        if "rss.arxiv.org/atom/" in url:
+            return _xml_response(content, status_code)
+        raise AssertionError(f"unexpected GET {url}")
+    monkeypatch.setattr(arxiv_mod.requests, "get", fake_get)
+    monkeypatch.setattr(arxiv_mod, "sleep", lambda *_: None)
+
 
 def test_arxiv_retriever(config, monkeypatch):
+    xml = Path("tests/retriever/arxiv_rss_example.xml").read_bytes()
+    parsed_result = feedparser.parse(xml)
+    _mock_rss_get(monkeypatch, xml)
 
-    parsed_result = feedparser.parse("tests/retriever/arxiv_rss_example.xml")
-    raw_parser = feedparser.parse
-    def mock_feedparser_parse(url, *args, **kwargs):
-        if url == f"https://rss.arxiv.org/atom/{'+'.join(config.source.arxiv.category)}":
-            return parsed_result
-        return raw_parser(url, *args, **kwargs)
-    monkeypatch.setattr(feedparser, "parse", mock_feedparser_parse)
-    
     retriever = ArxivRetriever(config)
     papers = retriever.retrieve_papers()
     parsed_results = [i for i in parsed_result.entries if i.get("arxiv_announce_type","new") == 'new']
@@ -57,13 +77,7 @@ Abstract: Skip me.</summary>
 def test_arxiv_retriever_rss_fallback(config, monkeypatch):
     import arxiv
     from zotero_arxiv_daily.retriever import arxiv_retriever as mod
-    parsed_result = feedparser.parse(RSS_FALLBACK_XML)
-    raw_parser = feedparser.parse
-    def mock_feedparser_parse(url, *args, **kwargs):
-        if url.startswith("https://rss.arxiv.org/atom/"):
-            return parsed_result
-        return raw_parser(url, *args, **kwargs)
-    monkeypatch.setattr(feedparser, "parse", mock_feedparser_parse)
+    _mock_rss_get(monkeypatch, RSS_FALLBACK_XML.encode("utf-8"))
 
     calls = []
     def always_406(self, search, offset=0):
@@ -125,3 +139,133 @@ def test_arxiv_live_api_with_user_agent():
         warnings.warn(f"arXiv live API check: HTTP {exc.status}")
         pytest.skip(f"arXiv API HTTP {exc.status}")
     assert len(results) == 1
+
+
+EMPTY_FEED_XML = """<?xml version='1.0' encoding='UTF-8'?>
+<feed xmlns:arxiv="http://arxiv.org/schemas/atom" xmlns="http://www.w3.org/2005/Atom">
+  <title>cs.AI updates on arXiv.org</title>
+  <updated>2026-11-22T05:00:00+00:00</updated>
+</feed>
+"""
+
+
+def test_load_rss_retries_empty_feed_on_weekday(monkeypatch):
+    payloads = [EMPTY_FEED_XML.encode("utf-8"), RSS_FALLBACK_XML.encode("utf-8")]
+    sleeps = []
+
+    def fake_get(url, *args, **kwargs):
+        return _xml_response(payloads.pop(0) if payloads else RSS_FALLBACK_XML.encode("utf-8"))
+
+    monkeypatch.setattr(arxiv_mod.requests, "get", fake_get)
+    monkeypatch.setattr(arxiv_mod, "sleep", lambda s: sleeps.append(s))
+    monkeypatch.setattr(
+        arxiv_mod, "_is_expected_empty_rss_day", lambda now=None: False
+    )
+    entries = arxiv_mod._load_new_arxiv_entries("https://rss.arxiv.org/atom/cs.AI")
+    assert set(entries) == {"2508.13435v1", "2508.13436v1"}
+    assert sleeps == [60]
+
+
+def test_load_rss_does_not_retry_empty_weekend_feed(monkeypatch):
+    sleeps = []
+
+    def fake_get(url, *args, **kwargs):
+        return _xml_response(EMPTY_FEED_XML.encode("utf-8"))
+
+    monkeypatch.setattr(arxiv_mod.requests, "get", fake_get)
+    monkeypatch.setattr(arxiv_mod, "sleep", lambda s: sleeps.append(s))
+    monkeypatch.setattr(arxiv_mod, "_is_expected_empty_rss_day", lambda now=None: True)
+    entries = arxiv_mod._load_new_arxiv_entries("https://rss.arxiv.org/atom/cs.AI")
+    assert entries == {}
+    assert sleeps == []
+
+
+def test_load_rss_retries_http_406_then_raises(monkeypatch):
+    calls = []
+
+    def fake_get(url, *args, **kwargs):
+        calls.append(url)
+        return _xml_response(b"", status_code=406)
+
+    monkeypatch.setattr(arxiv_mod.requests, "get", fake_get)
+    monkeypatch.setattr(arxiv_mod, "sleep", lambda *_: None)
+    monkeypatch.setattr(arxiv_mod, "_is_expected_empty_rss_day", lambda now=None: False)
+    try:
+        arxiv_mod._load_new_arxiv_entries("https://rss.arxiv.org/atom/cs.AI")
+        raise AssertionError("expected RssFetchError")
+    except arxiv_mod.RssFetchError as exc:
+        assert exc.status == 406
+    assert len(calls) == 4
+
+
+def test_expected_empty_rss_day_weekend_vs_weekday():
+    from datetime import datetime
+    saturday = datetime(2026, 11, 21, 2, 0, tzinfo=arxiv_mod.EASTERN)
+    monday = datetime(2026, 11, 23, 2, 0, tzinfo=arxiv_mod.EASTERN)
+    assert arxiv_mod._is_expected_empty_rss_day(saturday) is True
+    assert arxiv_mod._is_expected_empty_rss_day(monday) is False
+
+
+
+LIST_NEW_HTML = """
+<html><body>
+<h3>New submissions (showing 1 of 1 entries)</h3>
+<dt>
+  <a href="/abs/2611.31284" title="Abstract" id="2611.31284">arXiv:2611.31284</a>
+</dt>
+<dd>
+  <div class="meta">
+    <div class='list-title mathjax'><span class='descriptor'>Title:</span> Hello World Paper</div>
+    <div class='list-authors'><a href="https://arxiv.org/search/?query=Smith">Alice Smith</a></div>
+    <p class='mathjax'>An abstract here.</p>
+  </div>
+</dd>
+<h3>Cross submissions (showing 1 of 1 entries)</h3>
+<dt>
+  <a href="/abs/2611.99999" title="Abstract">arXiv:2611.99999</a>
+</dt>
+<dd>
+  <div class='list-title mathjax'><span class='descriptor'>Title:</span> Should Skip</div>
+  <div class='list-authors'>Bob</div>
+  <p class='mathjax'>Cross.</p>
+</dd>
+</body></html>
+"""
+
+
+def test_parse_new_list_html_skips_cross_and_replacements():
+    entries = arxiv_mod._parse_new_list_html(LIST_NEW_HTML)
+    assert set(entries) == {"2611.31284"}
+    entry = entries["2611.31284"]
+    assert entry.get("title") == "Hello World Paper"
+    assert entry.get("summary") == "An abstract here."
+    assert entry.get("author") == "Alice Smith"
+    raw = arxiv_mod._rss_entry_to_raw("2611.31284", entry)
+    assert raw.title == "Hello World Paper"
+    assert raw.summary == "An abstract here."
+    assert [a.name for a in raw.authors] == ["Alice Smith"]
+
+
+def test_load_rss_falls_back_to_new_list_on_empty_weekday(monkeypatch):
+    sleeps = []
+
+    def fake_get(url, *args, **kwargs):
+        if "rss.arxiv.org" in url:
+            return _xml_response(EMPTY_FEED_XML.encode("utf-8"))
+        if url.endswith("/list/cs.AI/new"):
+            class Resp:
+                status_code = 200
+                text = LIST_NEW_HTML
+                def raise_for_status(self):
+                    return None
+            return Resp()
+        raise AssertionError(f"unexpected GET {url}")
+
+    monkeypatch.setattr(arxiv_mod.requests, "get", fake_get)
+    monkeypatch.setattr(arxiv_mod, "sleep", lambda s: sleeps.append(s))
+    monkeypatch.setattr(arxiv_mod, "_is_expected_empty_rss_day", lambda now=None: False)
+    entries = arxiv_mod._load_new_arxiv_entries(
+        "https://rss.arxiv.org/atom/cs.AI", categories=["cs.AI"]
+    )
+    assert set(entries) == {"2611.31284"}
+    assert sleeps == []

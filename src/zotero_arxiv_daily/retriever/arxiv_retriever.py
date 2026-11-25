@@ -13,6 +13,9 @@ import re
 from queue import Empty
 from time import sleep
 from typing import Any, Callable, TypeVar
+from datetime import datetime
+from zoneinfo import ZoneInfo
+from collections import Counter
 from loguru import logger
 import requests
 
@@ -30,6 +33,10 @@ USER_AGENT = (
 RETRIABLE_STATUS = (403, 406, 429, 503)
 # Blocks (403/406) rarely clear within minutes; retry briefly, then fall back to RSS.
 BLOCK_STATUS = (403, 406)
+# RSS is rebuilt at midnight Eastern; retry empty/blocked fetches before giving up.
+RSS_MAX_ATTEMPTS = 4
+RSS_RETRY_SECONDS = (60, 180, 300)
+EASTERN = ZoneInfo("America/New_York")
 
 
 class _UserAgentSession(requests.Session):
@@ -105,6 +112,218 @@ def _short_id(result) -> str:
         return str(getattr(result, "entry_id", "")).rsplit("/", 1)[-1]
 
 
+class RssFetchError(Exception):
+    """HTTP failure when downloading an arXiv Atom/RSS feed."""
+
+    def __init__(self, status: int, url: str, message: str | None = None):
+        self.status = status
+        self.url = url
+        super().__init__(message or f"HTTP {status} fetching {url}")
+
+
+def _is_expected_empty_rss_day(now: datetime | None = None) -> bool:
+    """arXiv does not announce Friday or Saturday, so Sat/Sun ET feeds are empty."""
+    now = now or datetime.now(EASTERN)
+    return now.weekday() >= 5  # Saturday=5, Sunday=6
+
+
+def _fetch_atom_feed(url: str) -> tuple[Any, int]:
+    """Download an arXiv Atom feed with our User-Agent and parse it.
+
+    feedparser.parse(url) can swallow HTTP 403/406 into an empty feed; fetch
+    with requests first so callers can retry or fail visibly.
+    """
+    response = requests.get(url, timeout=60, headers={"User-Agent": USER_AGENT})
+    if response.status_code in RETRIABLE_STATUS:
+        raise RssFetchError(response.status_code, url)
+    response.raise_for_status()
+    feed = feedparser.parse(response.content, agent=USER_AGENT)
+    return feed, response.status_code
+
+
+def _new_entries_from_feed(feed) -> dict:
+    if "Feed error for query" in feed.feed.get("title", ""):
+        raise Exception(f"Invalid ARXIV_QUERY: {feed.feed.get('title', '')}.")
+    new_entries = {}
+    for e in feed.entries:
+        if e.get("arxiv_announce_type", "new") == "new":
+            new_entries[e.id.removeprefix("oai:arXiv.org:")] = e
+    return new_entries
+
+
+def _log_rss_feed(url: str, feed, status: int, new_count: int) -> None:
+    types = Counter(e.get("arxiv_announce_type", "missing") for e in feed.entries)
+    logger.info(
+        f"arXiv RSS {url} HTTP {status} updated={feed.feed.get('updated', 'unknown')} "
+        f"entries={len(feed.entries)} types={dict(types)} new={new_count}"
+    )
+
+
+
+_NEW_SECTION_RE = re.compile(
+    r"<h3>New submissions.*?</h3>(.*?)(?:<h3>(?:Cross|Replacement) submissions|$)",
+    flags=re.I | re.S,
+)
+_DT_DD_RE = re.compile(r"<dt>(.*?)</dt>\s*<dd>(.*?)</dd>", flags=re.I | re.S)
+_ABS_ID_RE = re.compile(r'href\s*=\s*"/abs/([^"\s]+)"', flags=re.I)
+_TITLE_RE = re.compile(
+    r"class=['\"]list-title[^'\"]*['\"][^>]*>.*?</span>\s*(.*?)</div>",
+    flags=re.I | re.S,
+)
+_AUTHORS_RE = re.compile(r"class=['\"]list-authors['\"][^>]*>(.*?)</div>", flags=re.I | re.S)
+_ABSTRACT_RE = re.compile(r"<p class=['\"]mathjax['\"]>(.*?)</p>", flags=re.I | re.S)
+
+
+class HtmlListEntry:
+    """feedparser-like entry built from arXiv /list/{cat}/new HTML."""
+
+    def __init__(self, arxiv_id: str, title: str, abstract: str, authors: str):
+        self.id = f"oai:arXiv.org:{arxiv_id}"
+        self._data = {
+            "title": title,
+            "summary": abstract,
+            "author": authors,
+            "arxiv_announce_type": "new",
+        }
+
+    def get(self, key, default=None):
+        return self._data.get(key, default)
+
+
+def _strip_html(text: str) -> str:
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.I)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    return (
+        text.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", '"')
+        .replace("&#39;", "'")
+        .strip()
+    )
+
+
+def _parse_new_list_html(html: str) -> dict:
+    """Parse 'New submissions' only (not cross-lists or replacements)."""
+    match = _NEW_SECTION_RE.search(html)
+    if not match:
+        return {}
+    entries = {}
+    for dt, dd in _DT_DD_RE.findall(match.group(1)):
+        id_match = _ABS_ID_RE.search(dt)
+        if not id_match:
+            continue
+        arxiv_id = id_match.group(1)
+        title_m = _TITLE_RE.search(dd)
+        authors_m = _AUTHORS_RE.search(dd)
+        abstract_m = _ABSTRACT_RE.search(dd)
+        title = _strip_html(title_m.group(1)) if title_m else arxiv_id
+        authors = _strip_html(authors_m.group(1)) if authors_m else ""
+        abstract = _strip_html(abstract_m.group(1)) if abstract_m else ""
+        entries[arxiv_id] = HtmlListEntry(arxiv_id, title, abstract, authors)
+    return entries
+
+
+def _fetch_new_list_entries(categories: list[str]) -> dict:
+    """Fallback: HTML new listings, which follow the 20:00 ET announcement."""
+    merged: dict = {}
+    for cat in categories:
+        url = f"https://arxiv.org/list/{cat}/new"
+        try:
+            response = requests.get(url, timeout=60, headers={"User-Agent": USER_AGENT})
+            if response.status_code in RETRIABLE_STATUS:
+                logger.warning(f"arXiv /new list HTTP {response.status_code} for {url}")
+                continue
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            logger.warning(f"arXiv /new list request failed for {url}: {exc!r}")
+            continue
+        parsed = _parse_new_list_html(response.text)
+        logger.info(f"arXiv /new list {url} HTTP {response.status_code} new={len(parsed)}")
+        merged.update(parsed)
+    return merged
+
+
+def _load_new_arxiv_entries(url: str, categories: list[str] | None = None) -> dict:
+    """Fetch the daily Atom feed, retrying transient HTTP errors and empty weekday feeds.
+
+    arXiv RSS is rebuilt at midnight Eastern, several hours after the 20:00 ET
+    announcement. When a weekday RSS fetch is empty, fall back to
+    /list/{category}/new, which tracks the announcement mailing.
+    """
+    new_entries: dict = {}
+    last_error: Exception | None = None
+    expected_empty = _is_expected_empty_rss_day()
+    attempts = 1 if expected_empty else RSS_MAX_ATTEMPTS
+    categories = categories or []
+    for attempt in range(attempts):
+        try:
+            feed, status = _fetch_atom_feed(url)
+            last_error = None
+        except RssFetchError as exc:
+            last_error = exc
+            logger.warning(f"{exc}; attempt {attempt + 1}/{attempts}")
+            if not expected_empty and categories:
+                fallback = _fetch_new_list_entries(categories)
+                if fallback:
+                    logger.warning(
+                        f"Using {len(fallback)} papers from arXiv /new listings after RSS HTTP {exc.status}"
+                    )
+                    return fallback
+            if attempt < attempts - 1:
+                sleep(RSS_RETRY_SECONDS[min(attempt, len(RSS_RETRY_SECONDS) - 1)])
+                continue
+            break
+        except requests.RequestException as exc:
+            last_error = exc
+            logger.warning(f"arXiv RSS request failed ({exc!r}); attempt {attempt + 1}/{attempts}")
+            if not expected_empty and categories:
+                fallback = _fetch_new_list_entries(categories)
+                if fallback:
+                    logger.warning(
+                        f"Using {len(fallback)} papers from arXiv /new listings after RSS request error"
+                    )
+                    return fallback
+            if attempt < attempts - 1:
+                sleep(RSS_RETRY_SECONDS[min(attempt, len(RSS_RETRY_SECONDS) - 1)])
+                continue
+            break
+        new_entries = _new_entries_from_feed(feed)
+        _log_rss_feed(url, feed, status, len(new_entries))
+        if new_entries or expected_empty:
+            break
+        if not expected_empty and categories:
+            fallback = _fetch_new_list_entries(categories)
+            if fallback:
+                logger.warning(
+                    f"arXiv RSS empty; using {len(fallback)} papers from /new listings "
+                    "(RSS rebuilds at midnight ET, after the 20:00 ET announcement)"
+                )
+                return fallback
+        if attempt < attempts - 1:
+            wait = RSS_RETRY_SECONDS[min(attempt, len(RSS_RETRY_SECONDS) - 1)]
+            logger.warning(
+                f"arXiv RSS returned 0 new papers before the midnight-ET rebuild "
+                f"may be ready; retry {attempt + 1}/{attempts} in {wait}s"
+            )
+            sleep(wait)
+    if last_error and not new_entries:
+        raise last_error
+    if not new_entries:
+        if expected_empty:
+            logger.info(
+                "arXiv RSS has no new papers (expected on Saturday/Sunday ET and arXiv holidays)"
+            )
+        else:
+            logger.warning(
+                "arXiv RSS still has 0 new papers after retries on a weekday; "
+                "no email will be sent if every source is empty"
+            )
+    return new_entries
+
+
 @register_retriever("arxiv")
 class ArxivRetriever(BaseRetriever):
     def __init__(self, config):
@@ -116,14 +335,11 @@ class ArxivRetriever(BaseRetriever):
         # Prefer fewer inner retries; outer loop handles 403/406/429/503 with backoff.
         client = _make_arxiv_client(num_retries=3, delay_seconds=15, page_size=50)
         query = '+'.join(self.config.source.arxiv.category)
-        # Get the latest paper from arxiv rss feed
-        feed = feedparser.parse(f"https://rss.arxiv.org/atom/{query}", agent=USER_AGENT)
-        if 'Feed error for query' in feed.feed.get('title', ''):
-            raise Exception(f"Invalid ARXIV_QUERY: {query}.")
-        new_entries = {}
-        for e in feed.entries:
-            if e.get("arxiv_announce_type", "new") == 'new':
-                new_entries[e.id.removeprefix("oai:arXiv.org:")] = e
+        # Daily Atom feed, rebuilt at midnight Eastern. See _load_new_arxiv_entries.
+        new_entries = _load_new_arxiv_entries(
+            f"https://rss.arxiv.org/atom/{query}",
+            categories=list(self.config.source.arxiv.category),
+        )
         all_paper_ids = list(new_entries.keys())
         if self.config.executor.debug:
             all_paper_ids = all_paper_ids[:10]
